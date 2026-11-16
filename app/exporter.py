@@ -35,9 +35,17 @@ PATIENTS_SQL = (
     "WHERE trial_id = $1 ORDER BY patient_id"
 )
 LABS_SQL = (
-    "SELECT l.lab_id, l.patient_id, l.value "
-    "FROM labs l JOIN patients p ON p.patient_id = l.patient_id "
+    "SELECT l.lab_id, l.patient_id, l.value, l.instrument_id, "
+    "       ls.standard_value, ls.rule_version, ls.a, ls.b "
+    "FROM labs l "
+    "JOIN patients p ON p.patient_id = l.patient_id "
+    "LEFT JOIN lab_standard ls ON ls.lab_id = l.lab_id "
     "WHERE p.trial_id = $1 ORDER BY l.lab_id"
+)
+# 快照时刻各仪器的生效规则；与两份明细共用同一快照，保证口径一致。
+RULES_SQL = (
+    "SELECT instrument_id, active_a, active_b, rule_version, rule_updated_at "
+    "FROM instruments ORDER BY instrument_id"
 )
 
 
@@ -57,6 +65,7 @@ class Batch:
     finished_at: float | None = None
     patients_rows: int = 0
     labs_rows: int = 0
+    rules_rows: int = 0
     directory: Path | None = None
     zip_path: Path | None = None
     conns: list[asyncpg.Connection] = field(default_factory=list)
@@ -78,6 +87,7 @@ class Batch:
             "finished_at": self.finished_at,
             "patients_rows": self.patients_rows,
             "labs_rows": self.labs_rows,
+            "rules_rows": self.rules_rows,
             "slow_seconds": self.slow_seconds,
             "kill_reader_after": self.kill_reader_after,
             "connections_open": self.connections_open,
@@ -169,7 +179,10 @@ class BatchManager:
         try:
             ctrl = await asyncpg.connect(
                 self.dsn,
-                server_settings={"application_name": f"export-ctrl-{batch.id[:8]}"},
+                server_settings={
+                    "application_name": f"export-ctrl-{batch.id[:8]}",
+                    "max_parallel_workers_per_gather": "0",
+                },
             )
             try:
                 for pid in pids:
@@ -197,8 +210,8 @@ class BatchManager:
             snapshot = await keeper.fetchval("SELECT pg_export_snapshot()")
             self._check_cancelled(batch)
 
-            # 2) 两条独立 reader 连接导入同一快照
-            for role in ("patients", "labs"):
+            # 2) 三条独立 reader 连接导入同一快照（每连接同一时刻只跑一条查询）
+            for role in ("patients", "labs", "rules"):
                 conn = await self._connect(batch, role)
                 await conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
                 await conn.execute(f"SET TRANSACTION SNAPSHOT '{snapshot}'")
@@ -211,24 +224,37 @@ class BatchManager:
                     self._kill_reader(batch, readers[1])
                 )
 
-            # 3) 两表并行读取（各自独立连接、同一快照）
+            # 3) 三份数据并行读取（各自独立连接、同一快照）
             patients_csv = batch.directory / "patients.csv"
             labs_csv = batch.directory / "labs.csv"
-            batch.patients_rows, batch.labs_rows = await asyncio.gather(
+            rules_csv = batch.directory / "rules.csv"
+            batch.patients_rows, batch.labs_rows, batch.rules_rows = await asyncio.gather(
                 self._read_table(
                     batch, readers[0], PATIENTS_SQL,
                     ("patient_id", "trial_id"), patients_csv,
+                    args=(batch.trial_id,),
                 ),
                 self._read_table(
                     batch, readers[1], LABS_SQL,
-                    ("lab_id", "patient_id", "value"), labs_csv,
+                    ("lab_id", "patient_id", "value", "instrument_id",
+                     "standard_value", "rule_version", "a", "b"),
+                    labs_csv,
+                    args=(batch.trial_id,),
+                ),
+                self._read_table(
+                    batch, readers[2], RULES_SQL,
+                    ("instrument_id", "active_a", "active_b",
+                     "rule_version", "rule_updated_at"),
+                    rules_csv,
                 ),
             )
             self._check_cancelled(batch)
 
-            # 4) 两份 CSV 均完整才打包 ZIP
+            # 4) CSV 均完整才打包 ZIP
             zip_path = batch.directory / f"export_{batch.trial_id}_{batch.id[:8]}.zip"
-            await asyncio.to_thread(self._make_zip, zip_path, patients_csv, labs_csv)
+            await asyncio.to_thread(
+                self._make_zip, zip_path, patients_csv, labs_csv, rules_csv
+            )
             self._check_cancelled(batch)
 
             if not self._finish(batch, READY):
@@ -245,12 +271,12 @@ class BatchManager:
                 batch.watchdog.cancel()
             await self._release(batch, keeper, readers)
 
-    async def _read_table(self, batch, conn, sql, header, path) -> int:
+    async def _read_table(self, batch, conn, sql, header, path, args=()) -> int:
         if batch.slow_seconds > 0:
             # 模拟慢查询：pg_sleep 与正式查询处于同一快照事务，可被取消
             await conn.fetchval("SELECT pg_sleep($1)", batch.slow_seconds)
         self._check_cancelled(batch)
-        rows = await conn.fetch(sql, batch.trial_id)
+        rows = await conn.fetch(sql, *args)
         self._check_cancelled(batch)
         await asyncio.to_thread(self._write_csv, path, header, rows)
         return len(rows)
@@ -263,6 +289,7 @@ class BatchManager:
             server_settings={
                 "application_name": f"export-{role}-{batch.id[:8]}",
                 "jit": "off",
+                "max_parallel_workers_per_gather": "0",
             },
         )
         batch.conns.append(conn)
@@ -283,7 +310,8 @@ class BatchManager:
                 ctrl = await asyncpg.connect(
                     self.dsn,
                     server_settings={
-                        "application_name": f"export-killer-{batch.id[:8]}"
+                        "application_name": f"export-killer-{batch.id[:8]}",
+                        "max_parallel_workers_per_gather": "0",
                     },
                 )
                 try:
@@ -343,7 +371,8 @@ class BatchManager:
                 writer.writerow([row[i] for i in range(len(header))])
 
     @staticmethod
-    def _make_zip(zip_path, patients_csv, labs_csv) -> None:
+    def _make_zip(zip_path, patients_csv, labs_csv, rules_csv) -> None:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(patients_csv, "patients.csv")
             zf.write(labs_csv, "labs.csv")
+            zf.write(rules_csv, "rules.csv")

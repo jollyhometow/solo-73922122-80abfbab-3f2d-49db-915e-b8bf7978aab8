@@ -42,7 +42,11 @@ class Mutator:
 
     async def _loop(self) -> None:
         conn = await asyncpg.connect(
-            self.dsn, server_settings={"application_name": "mutator"}
+            self.dsn,
+            server_settings={
+                "application_name": "mutator",
+                "max_parallel_workers_per_gather": "0",
+            },
         )
         try:
             row = await conn.fetchrow(
@@ -53,6 +57,12 @@ class Mutator:
                 r["trial_id"]
                 for r in await conn.fetch(
                     "SELECT DISTINCT trial_id FROM patients ORDER BY 1"
+                )
+            ]
+            instruments = [
+                r["instrument_id"]
+                for r in await conn.fetch(
+                    "SELECT instrument_id FROM instruments ORDER BY 1"
                 )
             ]
             while True:
@@ -75,16 +85,39 @@ class Mutator:
                             pid, delta,
                         )
                         self.corrections += 1
-                        self.recent.append(
-                            {
-                                "seq": self.corrections,
-                                "patient_id": pid,
-                                "from": old,
-                                "to": new,
-                                "delta": delta,
-                                "at": time.time(),
-                            }
-                        )
+                        entry = {
+                            "seq": self.corrections,
+                            "patient_id": pid,
+                            "from": old,
+                            "to": new,
+                            "delta": delta,
+                            "instrument_changes": 0,
+                            "at": time.time(),
+                        }
+                        # 约 1/4 概率顺带把该患者一条检验改挂到别的仪器：
+                        # 触发器会在同一事务内按新仪器生效规则重建标准值。
+                        if instruments and random.random() < 0.25:
+                            moved = await conn.fetchval(
+                                """
+                                UPDATE labs SET instrument_id = sub.new_inst
+                                FROM (
+                                    SELECT l.lab_id,
+                                           (SELECT i.instrument_id FROM instruments i
+                                            WHERE i.instrument_id <> l.instrument_id
+                                            ORDER BY random() LIMIT 1) AS new_inst
+                                    FROM labs l
+                                    WHERE l.patient_id = $1 AND l.instrument_id = ANY($2)
+                                    ORDER BY random() LIMIT 1
+                                ) sub
+                                WHERE labs.lab_id = sub.lab_id
+                                RETURNING labs.lab_id
+                                """,
+                                pid, instruments,
+                            )
+                            if moved is not None:
+                                entry["instrument_changes"] = 1
+                                entry["moved_lab_id"] = moved
+                        self.recent.append(entry)
                 await asyncio.sleep(self.interval)
         finally:
             await conn.close()

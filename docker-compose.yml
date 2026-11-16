@@ -21,11 +21,16 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/clinical
       EXPORT_DIR: /data/exports
+    volumes:
+      # 导出产物落到命名卷，容器重建后批次历史目录仍可管理
+      - exports:/data/exports
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:
+  exports:
